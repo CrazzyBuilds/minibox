@@ -803,7 +803,7 @@ sequenceDiagram
     participant P as pasta
     R->>C: clone() avec CLONE_NEWNET
     Note over C: bloqué : lit le tube (fd 3)
-    R->>P: pasta --config-net -t 8123:8000 <PID>
+    R->>P: pasta --config-net -t 8123:8000 (PID de child)
     P->>C: rejoint son netns, crée l'interface
     P-->>R: prêt (passe en arrière-plan)
     R->>C: ferme le tube = feu vert
