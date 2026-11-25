@@ -709,6 +709,154 @@ Sur Azure (TD4), le problème n'existait pas : la micro-VM avait **vraiment**
 
 ---
 
+## 6. Étape 6 : le réseau
+
+### Un namespace réseau neuf : une pile réseau vide
+
+Avec `CLONE_NEWNET`, le conteneur reçoit **sa propre pile réseau** : ses
+interfaces, ses adresses, sa table de routage, et **ses propres ports**.
+Au départ, elle est vide.
+
+```
+=== hôte :       lo, enp2s0, wlo1 (10.17.213.206), br-… (le réseau de Docker)
+=== conteneur :  lo 127.0.0.1/8            ← et c'est tout
+ping 1.1.1.1 :   Network unreachable
+```
+
+Même `lo` est **éteinte** dans un namespace neuf : minibox l'allume avec un
+`ioctl` (l'équivalent de `ip link set lo up`).
+
+### Deux `localhost` différents
+
+```
+API dans le conteneur :          Server listening on http://localhost:8000
+curl localhost:8000 (hôte) :     connexion impossible
+netns de l'API : net:[4026534247] | hôte : net:[4026531833]
+```
+
+```mermaid
+flowchart LR
+    subgraph H["hôte · netns 4026531833"]
+      C["curl localhost:8000"] --> LH["lo de l'hôte<br/>port 8000 : personne"]
+    end
+    subgraph K["conteneur · netns 4026534247"]
+      LC["lo du conteneur<br/>port 8000 : node ✅"]
+    end
+    LH -. aucun lien .- LC
+```
+
+`localhost` désigne **la pile réseau du namespace courant**. L'API écoute sur
+celui du conteneur, `curl` frappe à celui de l'hôte. C'est pour ça qu'une API
+dans Docker ne répond pas sans `-p 8000:8000`.
+
+### Comment Docker relie le conteneur (en root)
+
+```mermaid
+flowchart LR
+    subgraph conteneur
+      E1["eth0<br/>172.18.0.2"]
+    end
+    E1 ===|"paire veth<br/>(câble virtuel)"| V["veth… "]
+    V --- BR["pont br-…<br/>172.18.0.1"]
+    BR --> NAT["règles de pare-feu<br/>NAT, -p 8000:8000"] --> NET["wlo1 → Internet"]
+```
+
+Une **paire veth** est un câble virtuel : un bout dans le conteneur, l'autre
+branché sur un pont de l'hôte (le `br-…` de la liste plus haut). Des règles de
+pare-feu traduisent les adresses et redirigent les ports publiés.
+**Tout ça demande root** : créer des interfaces et des règles sur l'hôte.
+
+### Comment minibox le relie (sans root) : pasta
+
+**pasta** (projet **passt**, utilisé par Podman) est un **programme
+ordinaire** qui :
+1. rejoint le namespace réseau du conteneur et y crée une interface ;
+2. copie la configuration de l'hôte (adresse, route par défaut) ;
+3. **relaie** chaque connexion à travers des **sockets normales de l'hôte**,
+   comme le ferait n'importe quel programme qui se connecte à Internet.
+
+```mermaid
+flowchart LR
+    subgraph conteneur
+      N["node :8000"] --- T["interface tap<br/>10.17.213.206"]
+    end
+    T <--> P["pasta<br/>(processus de nathan)"]
+    P <-->|"sockets ordinaires"| HS["pile réseau de l'hôte"]
+    CU["curl localhost:8123"] --> HS
+    HS --> I["Internet"]
+```
+
+Pour Internet, c'est pasta qui se connecte. Pour un port publié, c'est pasta
+qui **écoute sur le port de l'hôte** et retransmet à l'intérieur.
+
+### Le tube de synchronisation
+
+Pour brancher le réseau, il faut agir **de l'extérieur** sur un conteneur
+**qui existe déjà** (pasta a besoin de son PID). Mais la commande ne doit pas
+démarrer avant que le réseau soit prêt. D'où un **tube** entre parent et
+enfant :
+
+```mermaid
+sequenceDiagram
+    participant R as minibox run (hôte)
+    participant C as minibox child (conteneur)
+    participant P as pasta
+    R->>C: clone() avec CLONE_NEWNET
+    Note over C: bloqué : lit le tube (fd 3)
+    R->>P: pasta --config-net -t 8123:8000 <PID>
+    P->>C: rejoint son netns, crée l'interface
+    P-->>R: prêt (passe en arrière-plan)
+    R->>C: ferme le tube = feu vert
+    Note over C: lo up, montages, pivot_root…
+    C->>C: exec("node dist/index.js")
+```
+
+`runc` utilise exactement ce mécanisme entre ses différentes phases.
+
+### Le DNS : le piège du 127.0.0.53
+
+Premier essai : `ping 1.1.1.1` passe, mais `wget example.com` échoue.
+
+- L'image **n'a pas** de `/etc/resolv.conf` : Docker l'**injecte** au
+  lancement.
+- Ton PC utilise `nameserver 127.0.0.53` (systemd-resolved) : une adresse de
+  **son** `localhost`, donc injoignable depuis le conteneur.
+
+Solution (celle de Podman) : `pasta --dns-forward 169.254.1.1` relaie vers le
+DNS de l'hôte tout ce qui est envoyé à `169.254.1.1` dans le conteneur, et
+minibox écrit `nameserver 169.254.1.1` dans le `resolv.conf` du conteneur.
+
+```
+resolv.conf : nameserver 169.254.1.1
+wget example.com : <title>Example Domain</title>
+```
+
+### Le résultat : l'équivalent de `docker run -p 8123:8000`
+
+```
+$ ./minibox run -image images/sysinfo -memory 256M -fake-meminfo -p 8123:8000
+Server listening on http://localhost:8000
+
+depuis l'hôte :
+  localhost:8000 → connexion impossible        ← le port du conteneur n'est pas celui de l'hôte
+  localhost:8123 → hostname minibox | Alpine Linux | mem 256 Mo | 2 processus
+après l'arrêt du conteneur : pasta est parti avec le namespace
+```
+
+| Option | Réseau du conteneur |
+|---|---|
+| `-net none` (défaut) | isolé : seulement `lo` |
+| `-net pasta` | connecté à Internet via pasta |
+| `-p 8123:8000` | pasta + port 8123 de l'hôte → port 8000 du conteneur |
+| `-net host` | celui de l'hôte (comme aux étapes 1 à 5, et `docker run --network host`) |
+
+> **À retenir** : un namespace réseau = une pile réseau complète, vide au
+> départ, avec **son propre `localhost` et ses propres ports**. En root,
+> Docker le relie avec un câble virtuel (veth) et un pont ; sans root, pasta
+> relaie le trafic à travers des sockets ordinaires.
+
+---
+
 ## 7. Étape 7 (bonus) : faire voir ses limites au conteneur
 
 L'étape 5 a laissé un problème : l'API est limitée à 256 Mo, mais `sysinfo`
@@ -846,15 +994,19 @@ rien à truquer.
 ## Récapitulatif
 
 ```
-  ./minibox run -image images/sysinfo -memory 256M -cpus 0.5 -fake-meminfo
+  ./minibox run -image images/sysinfo -memory 256M -cpus 0.5 -fake-meminfo -p 8123:8000
      │
      ├─ lit config.json (Cmd, WorkingDir, Env)                 (run)
      ├─ crée containers/<id>/{upper,work,merged}
      ├─ crée le cgroup minibox/<id> et écrit ses limites
-     ├─ clone() avec CLONE_NEWUSER, NEWUTS, NEWPID, NEWNS, NEWCGROUP
+     ├─ clone() avec CLONE_NEWUSER, NEWUTS, NEWPID, NEWNS, NEWCGROUP, NEWNET
      │          et CLONE_INTO_CGROUP (né dans son cgroup)
+     ├─ pasta --config-net -t 8123:8000 <PID>        réseau branché de l'extérieur
+     ├─ ferme le tube de synchronisation             feu vert pour l'enfant
      │
      └─ dans l'enfant :                                         (child)
+          ├─ attend le feu vert (tube, fd 3)
+          ├─ lo up                          namespace réseau
           ├─ uid 1000 → uid 0               namespace user
           ├─ sethostname("minibox")         namespace UTS
           ├─ montages privés                namespace mount
@@ -863,6 +1015,7 @@ rien à truquer.
           ├─ /proc neuf, /sys/fs/cgroup, /dev empruntés
           ├─ démontage de l'ancienne racine
           ├─ (option) faux /proc/meminfo    façon lxcfs
+          ├─ /etc/resolv.conf → 169.254.1.1 DNS relayé par pasta
           ├─ chdir /app + environnement de l'image
           └─ exec("node dist/index.js")     → PID 1 du conteneur
 ```
@@ -888,6 +1041,8 @@ rien à truquer.
 | **OOM killer** | le mécanisme du noyau qui tue un processus quand la mémoire manque |
 | **throttling** | mise en pause d'un processus qui a épuisé son quota de CPU |
 | **lxcfs** | outil qui remplace des fichiers de `/proc` par des versions qui reflètent les limites du cgroup |
+| **veth** | paire d'interfaces virtuelles reliées comme un câble : un bout dans le conteneur, l'autre sur l'hôte |
+| **pasta** | programme qui relie un namespace réseau à l'hôte sans root, en relayant le trafic par des sockets ordinaires |
 | **FUSE** | système de fichiers dont le contenu est fabriqué par un programme, et non par le noyau |
 
 ---
@@ -1065,4 +1220,37 @@ conteneur. `sysinfo` lit ce fichier en croyant lire celui du noyau.
 C'est un fichier écrit une fois au démarrage, alors que le vrai est généré à
 chaque lecture. lxcfs utilise FUSE : un démon regénère le contenu à chaque
 lecture, à partir des valeurs actuelles du cgroup.
+</details>
+
+<details>
+<summary>24. L'API écoute sur localhost:8000 dans le conteneur. Pourquoi curl localhost:8000 échoue-t-il depuis l'hôte ?</summary>
+
+Chaque namespace réseau a sa propre pile réseau, donc son propre `localhost`
+et ses propres ports. L'API écoute sur celui du conteneur, `curl` contacte
+celui de l'hôte.
+</details>
+
+<details>
+<summary>25. Pourquoi Docker a-t-il besoin de root pour le réseau, et comment pasta s'en passe-t-il ?</summary>
+
+Docker crée des interfaces (veth, pont) et des règles de pare-feu sur l'hôte,
+ce qui demande root. pasta est un programme ordinaire qui relaie le trafic du
+conteneur à travers des sockets normales de l'hôte, et écoute lui-même sur
+les ports publiés.
+</details>
+
+<details>
+<summary>26. À quoi sert le tube de synchronisation entre run et child ?</summary>
+
+Le réseau se branche de l'extérieur, sur un conteneur qui existe déjà (pasta a
+besoin de son PID). L'enfant attend donc, bloqué sur le tube, que le parent
+ait fini, avant de lancer la commande.
+</details>
+
+<details>
+<summary>27. Pourquoi le DNS de l'hôte (127.0.0.53) ne marche-t-il pas dans le conteneur ?</summary>
+
+C'est une adresse de `localhost`, donc de la pile réseau de l'hôte. Dans le
+conteneur, `127.0.0.53` désigne son propre `lo`, où aucun résolveur n'écoute.
+pasta relaie une autre adresse (`169.254.1.1`) vers le vrai résolveur.
 </details>
