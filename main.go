@@ -1,28 +1,39 @@
 // minibox : un mini-runtime de conteneurs, pour comprendre ce que fait Docker.
 //
-// Usage : minibox run [-rootfs DIR] [-workdir DIR] <commande> [arguments...]
+// Usage :
+//
+//	minibox run [-image DIR | -rootfs DIR] [-workdir DIR] [commande [arguments...]]
 package main
 
 import (
+	"crypto/rand"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"syscall"
 )
 
-// Environnement de la commande : celui de l'image, pas celui de l'hôte.
-var containerEnv = []string{
-	"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
-	"HOME=/root",
-	"TERM=xterm",
-}
+// Environnement par défaut, quand on n'utilise pas d'image.
+var defaultEnv = []string{"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"}
 
 // Périphériques indispensables, empruntés à l'hôte : sans être vraiment root,
 // on ne peut pas en créer (mknod), mais on peut monter ceux qui existent.
 var devices = []string{"null", "zero", "random", "urandom", "tty"}
+
+// imageConfig : la partie de config.json qui nous intéresse.
+type imageConfig struct {
+	Config struct {
+		Cmd        []string
+		Env        []string
+		WorkingDir string
+	} `json:"config"`
+}
 
 func main() {
 	if len(os.Args) < 2 {
@@ -32,36 +43,53 @@ func main() {
 	switch os.Args[1] {
 	case "run":
 		flags := flag.NewFlagSet("run", flag.ExitOnError)
-		rootfs := flags.String("rootfs", "", "dossier à utiliser comme racine (vide : celle de l'hôte)")
-		workdir := flags.String("workdir", "/", "dossier courant dans le conteneur")
+		image := flags.String("image", "", "image extraite par pull-image.sh (couches + config)")
+		rootfs := flags.String("rootfs", "", "dossier à utiliser tel quel comme racine")
+		workdir := flags.String("workdir", "", "dossier courant dans le conteneur")
 		_ = flags.Parse(os.Args[2:])
-		if flags.NArg() == 0 {
-			usage()
-		}
-		run(*rootfs, *workdir, flags.Args())
+		run(*image, *rootfs, *workdir, flags.Args())
 	case "child":
-		// Appelé uniquement par run : child <rootfs> <workdir> <commande...>
-		child(os.Args[2], os.Args[3], os.Args[4:])
+		// Appelé uniquement par run : child <racine> <workdir> <overlay> <commande...>
+		child(os.Args[2], os.Args[3], os.Args[4], os.Args[5:])
 	default:
 		usage()
 	}
 }
 
-// run s'exécute sur l'hôte. Il relance minibox lui-même (/proc/self/exe) en
-// mode "child", dans de nouveaux namespaces : c'est le noyau qui les crée,
-// au moment du clone() du processus enfant.
-func run(rootfs, workdir string, args []string) {
-	if rootfs != "" {
-		abs, err := filepath.Abs(rootfs)
-		if err != nil {
-			fail("chemin du rootfs", err)
+// run s'exécute sur l'hôte. Il prépare ce qui peut l'être de l'extérieur, puis
+// relance minibox lui-même (/proc/self/exe) en mode "child", dans de nouveaux
+// namespaces : c'est le noyau qui les crée, au moment du clone() de l'enfant.
+func run(image, rootfs, workdir string, args []string) {
+	env := defaultEnv
+	overlay := "" // options de montage overlayfs, si on utilise une image
+
+	if image != "" {
+		cfg := loadConfig(image)
+		// Comme docker run : sans commande, on lance le CMD de l'image.
+		if len(args) == 0 {
+			args = cfg.Config.Cmd
 		}
-		rootfs = abs
+		if workdir == "" {
+			workdir = cfg.Config.WorkingDir
+		}
+		env = cfg.Config.Env
+		rootfs, overlay = prepareOverlay(image)
 	}
 
-	childArgs := append([]string{"child", rootfs, workdir}, args...)
+	if len(args) == 0 {
+		usage()
+	}
+	if workdir == "" {
+		workdir = "/"
+	}
+	if rootfs != "" {
+		rootfs = absolute(rootfs)
+	}
+
+	childArgs := append([]string{"child", rootfs, workdir, overlay}, args...)
 	cmd := exec.Command("/proc/self/exe", childArgs...)
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
+	cmd.Env = append(env, "HOME=/root", "TERM=xterm")
 
 	cmd.SysProcAttr = &syscall.SysProcAttr{
 		Cloneflags: syscall.CLONE_NEWUSER | // ses propres utilisateurs
@@ -84,13 +112,47 @@ func run(rootfs, workdir string, args []string) {
 	}
 }
 
+// prepareOverlay crée les dossiers propres à ce conteneur et renvoie le
+// dossier où sera montée la vue fusionnée, ainsi que les options d'overlayfs.
+//
+//	merged  ← ce que voit le conteneur : la superposition de tout le reste
+//	upper   ← les écritures de CE conteneur (lecture-écriture)
+//	layers/06 … layers/00  ← les couches de l'image (lecture seule, partagées)
+func prepareOverlay(image string) (merged, options string) {
+	layers, err := filepath.Glob(filepath.Join(absolute(image), "layers", "*"))
+	if err != nil || len(layers) == 0 {
+		fail("lecture des couches", fmt.Errorf("aucune couche dans %s/layers", image))
+	}
+	// overlayfs attend la couche du dessus en premier : on inverse l'ordre.
+	for i, j := 0, len(layers)-1; i < j; i, j = i+1, j-1 {
+		layers[i], layers[j] = layers[j], layers[i]
+	}
+
+	id := newID()
+	dir := absolute(filepath.Join("containers", id))
+	for _, sub := range []string{"upper", "work", "merged"} {
+		must("création de "+sub, os.MkdirAll(filepath.Join(dir, sub), 0o755))
+	}
+	fmt.Fprintf(os.Stderr, "minibox : conteneur %s (containers/%s)\n", id, id)
+
+	options = fmt.Sprintf("lowerdir=%s,upperdir=%s,workdir=%s,userxattr",
+		strings.Join(layers, ":"), filepath.Join(dir, "upper"), filepath.Join(dir, "work"))
+	return filepath.Join(dir, "merged"), options
+}
+
 // child s'exécute déjà dans les nouveaux namespaces. Il prépare
 // l'environnement du conteneur, puis se remplace par la commande demandée.
-func child(rootfs, workdir string, args []string) {
+func child(rootfs, workdir, overlay string, args []string) {
 	must("sethostname", syscall.Sethostname([]byte("minibox")))
 
 	// Les montages faits ici ne doivent pas se propager à l'hôte.
 	must("montages privés", syscall.Mount("", "/", "", syscall.MS_REC|syscall.MS_PRIVATE, ""))
+
+	if overlay != "" {
+		// Le montage overlay se fait ici, dans notre namespace mount : l'hôte
+		// ne le voit pas, et il disparaît avec le conteneur.
+		must("montage overlay", syscall.Mount("overlay", rootfs, "overlay", 0, overlay))
+	}
 
 	if rootfs != "" {
 		changeRoot(rootfs)
@@ -100,7 +162,6 @@ func child(rootfs, workdir string, args []string) {
 	}
 
 	must("chdir", os.Chdir(workdir))
-	must("environnement", setEnv(containerEnv))
 
 	path, err := exec.LookPath(args[0])
 	if err != nil {
@@ -108,7 +169,7 @@ func child(rootfs, workdir string, args []string) {
 	}
 	// exec() remplace le processus courant : la commande prend la place de
 	// minibox, avec le même PID et les mêmes namespaces.
-	must("exec", syscall.Exec(path, args, containerEnv))
+	must("exec", syscall.Exec(path, args, os.Environ()))
 }
 
 // changeRoot fait du dossier rootfs la racine "/" du conteneur.
@@ -145,27 +206,38 @@ func mountProc(target string) {
 	must("montage de "+target, syscall.Mount("proc", target, "proc", 0, ""))
 }
 
+func loadConfig(image string) imageConfig {
+	var cfg imageConfig
+	data, err := os.ReadFile(filepath.Join(image, "config.json"))
+	if err == nil {
+		err = json.Unmarshal(data, &cfg)
+	}
+	if err != nil {
+		fail("lecture de la configuration de l'image", err)
+	}
+	return cfg
+}
+
+func newID() string {
+	b := make([]byte, 3)
+	_, _ = rand.Read(b)
+	return hex.EncodeToString(b)
+}
+
+func absolute(path string) string {
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		fail("chemin "+path, err)
+	}
+	return abs
+}
+
 func touch(path string) error {
 	f, err := os.OpenFile(path, os.O_CREATE, 0o644)
 	if err != nil {
 		return err
 	}
 	return f.Close()
-}
-
-func setEnv(env []string) error {
-	os.Clearenv()
-	for _, kv := range env {
-		for i := range kv {
-			if kv[i] == '=' {
-				if err := os.Setenv(kv[:i], kv[i+1:]); err != nil {
-					return err
-				}
-				break
-			}
-		}
-	}
-	return nil
 }
 
 func must(step string, err error) {
@@ -180,6 +252,6 @@ func fail(step string, err error) {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage : minibox run [-rootfs DIR] [-workdir DIR] <commande> [arguments...]")
+	fmt.Fprintln(os.Stderr, "usage : minibox run [-image DIR | -rootfs DIR] [-workdir DIR] [commande [arguments...]]")
 	os.Exit(2)
 }
