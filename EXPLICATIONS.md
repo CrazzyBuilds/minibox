@@ -51,6 +51,7 @@ version différente de certaines ressources : c'est le rôle des **namespaces**.
 | **overlayfs** | il écrit sans abîmer l'image | 4 |
 | **cgroups** | limite de mémoire et de CPU | 5 |
 | namespace **réseau** | sa propre IP, ses propres ports | 6 |
+| namespace **cgroup** | son cgroup lui apparaît comme la racine | 7 |
 
 Les namespaces actifs d'un processus sont visibles dans `/proc/<pid>/ns/` :
 
@@ -708,15 +709,149 @@ Sur Azure (TD4), le problème n'existait pas : la micro-VM avait **vraiment**
 
 ---
 
+## 7. Étape 7 (bonus) : faire voir ses limites au conteneur
+
+L'étape 5 a laissé un problème : l'API est limitée à 256 Mo, mais `sysinfo`
+annonce 15 Go. Deux solutions existent dans le monde réel, et elles ne
+répondent pas au même besoin.
+
+```mermaid
+flowchart TB
+    Q["Le programme lit ses ressources"] --> A
+    Q --> B
+    subgraph A["A · méthode Docker"]
+      A1["namespace cgroup<br/>+ /sys/fs/cgroup monté"] --> A2["le programme PEUT lire<br/>memory.max s'il le cherche"]
+    end
+    subgraph B["B · méthode lxcfs"]
+      B1["/proc/meminfo recouvert<br/>par un faux fichier"] --> B2["le programme voit 256 Mo<br/>sans rien changer"]
+    end
+```
+
+### A. Le namespace cgroup : le conteneur peut trouver ses limites
+
+Deux ajouts :
+1. `CLONE_NEWCGROUP` : le cgroup du conteneur lui apparaît comme **la racine**
+   de l'arbre des cgroups ;
+2. le système de fichiers des cgroups est monté dans `/sys/fs/cgroup` : le
+   conteneur y lit **ses propres** fichiers.
+
+```
+                 vu de l'hôte                              vu du conteneur
+/sys/fs/cgroup/                                      /sys/fs/cgroup/   ← sa racine
+└── user.slice/…/user@1000.service/                      ├── memory.max   268435456
+    └── minibox/                                         ├── cpu.max      50000 100000
+        └── 2e0a5f/   ◄────────── même dossier ────────► └── …
+            ├── memory.max
+            └── cpu.max
+```
+
+Résultat sur la machine :
+
+```
+/proc/self/cgroup : 0::/                       ← avant : 0::/user.slice/user-1000.slice/…/minibox/c524ac
+memory.max        : 268435456
+cpu.max           : 50000 100000
+node os.totalmem()             : 15326 Mo      ← lit /proc/meminfo
+node process.constrainedMemory(): 256 Mo       ← lit le cgroup
+node os.availableParallelism()  : 8
+MemTotal (/proc/meminfo)        : 15693872 kB
+```
+
+Deux gains :
+- **sécurité** : le conteneur ne découvre plus le chemin de son cgroup sur
+  l'hôte (avant, `/proc/self/cgroup` révélait `user-1000`, le nom du service…) ;
+- **les limites deviennent lisibles**, mais seulement pour un programme qui
+  va les chercher : c'est ce que fait `process.constrainedMemory()` de Node,
+  ou la JVM depuis Java 10. `sysinfo`, lui, ne lit que `/proc` et voit
+  toujours 15 Go.
+
+C'est ce que fait Docker par défaut.
+
+### B. Le faux `/proc/meminfo` : le conteneur voit ses limites sans le savoir
+
+Avec `-fake-meminfo`, minibox :
+1. lit la limite dans `/sys/fs/cgroup/memory.max` (grâce à A) ;
+2. écrit un fichier `meminfo` qui annonce cette limite ;
+3. le monte **par-dessus** `/proc/meminfo` (bind mount sur un seul fichier).
+
+```
+/proc/
+├── cpuinfo     ← vrai (généré par le noyau)
+├── meminfo     ← RECOUVERT par /run/minibox-meminfo :
+│                    MemTotal:     262144 kB
+│                    MemFree:      258xxx kB
+│                    SwapTotal:    0 kB
+├── 1/ …        ← vrais
+```
+
+Résultat, avec **la même API, sans modifier son code** :
+
+```
+-memory 256M :                 mem.total : 15326 Mo | swap : 30656 Mo | cpu.cores : 8
+-memory 256M -fake-meminfo :   mem.total :   256 Mo | swap :     0 Mo | cpu.cores : 8
+```
+
+C'est le principe de **lxcfs**, utilisé par LXC et certains clusters
+Kubernetes, pour que les vieux programmes (qui ne connaissent pas les
+cgroups) se dimensionnent correctement.
+
+### La limite de notre version : une photo, pas une fenêtre
+
+```
+au démarrage :              MemFree : 251 Mo  |  memory.current : 8 Mo utilisés
+après avoir alloué 150 Mo : MemFree : 251 Mo  |  memory.current : 159 Mo utilisés
+                                      ▲
+                                      ne bouge pas : c'est un fichier écrit une fois
+```
+
+Le vrai `/proc/meminfo` est **généré à chaque lecture** (étape 2). Notre faux
+fichier, lui, est écrit **une seule fois**. lxcfs résout ça avec **FUSE** : un
+système de fichiers en espace utilisateur, où **un programme** (au lieu du
+noyau) fabrique le contenu à chaque lecture, en consultant le cgroup.
+
+```mermaid
+flowchart LR
+    subgraph notre version
+      P1["lecture de /proc/meminfo"] --> F1["fichier écrit au démarrage"]
+    end
+    subgraph lxcfs
+      P2["lecture de /proc/meminfo"] --> K["noyau"] --> D["démon lxcfs (FUSE)"] --> C["lit le cgroup<br/>maintenant"]
+    end
+```
+
+### Et le CPU ?
+
+`cpu.cores` affiche toujours 8 : on n'a pas touché à `/proc/cpuinfo` ni
+`/proc/stat`. C'est plus compliqué, car « 0,5 CPU » n'est pas un nombre de
+cœurs : c'est un quota de temps (50 ms toutes les 100 ms), sur **tous** les
+cœurs. lxcfs arrondit (0,5 → 1 cœur) et réécrit aussi ces fichiers.
+
+À comparer avec Azure (TD4) : la micro-VM avait **vraiment** 1 vCPU, donc
+rien à truquer.
+
+| Méthode | Ce que voit `sysinfo` | Coût |
+|---|---|---|
+| rien (étape 5) | 15 Go, 8 cœurs | — |
+| A : namespace cgroup (Docker) | 15 Go, 8 cœurs (mais limites lisibles dans `/sys/fs/cgroup`) | aucun |
+| B : faux `/proc` (lxcfs) | 256 Mo (8 cœurs ici, 1 avec lxcfs) | un démon FUSE sur l'hôte |
+| micro-VM (Azure) | 1,5 Go, 1 cœur : **la vérité** | un noyau et une VM par conteneur |
+
+> **À retenir** : un conteneur ne peut pas « voir » ses limites dans `/proc`,
+> parce que `/proc` décrit la machine. Soit le programme lit son cgroup
+> (méthode Docker), soit on lui ment dans `/proc` (méthode lxcfs), soit on
+> lui donne une vraie machine plus petite (micro-VM).
+
+---
+
 ## Récapitulatif
 
 ```
-  ./minibox run -image images/sysinfo -memory 256M -cpus 0.5
+  ./minibox run -image images/sysinfo -memory 256M -cpus 0.5 -fake-meminfo
      │
      ├─ lit config.json (Cmd, WorkingDir, Env)                 (run)
      ├─ crée containers/<id>/{upper,work,merged}
      ├─ crée le cgroup minibox/<id> et écrit ses limites
-     ├─ clone() avec CLONE_NEWUSER, NEWUTS, NEWPID, NEWNS
+     ├─ clone() avec CLONE_NEWUSER, NEWUTS, NEWPID, NEWNS, NEWCGROUP
      │          et CLONE_INTO_CGROUP (né dans son cgroup)
      │
      └─ dans l'enfant :                                         (child)
@@ -725,8 +860,9 @@ Sur Azure (TD4), le problème n'existait pas : la micro-VM avait **vraiment**
           ├─ montages privés                namespace mount
           ├─ mount overlay → merged         couches + upper
           ├─ bind + pivot_root sur merged   fichiers de l'image
-          ├─ /proc neuf + /dev empruntés
+          ├─ /proc neuf, /sys/fs/cgroup, /dev empruntés
           ├─ démontage de l'ancienne racine
+          ├─ (option) faux /proc/meminfo    façon lxcfs
           ├─ chdir /app + environnement de l'image
           └─ exec("node dist/index.js")     → PID 1 du conteneur
 ```
@@ -751,6 +887,8 @@ Sur Azure (TD4), le problème n'existait pas : la micro-VM avait **vraiment**
 | **cgroup** | groupe de processus dont le noyau compte et limite la consommation |
 | **OOM killer** | le mécanisme du noyau qui tue un processus quand la mémoire manque |
 | **throttling** | mise en pause d'un processus qui a épuisé son quota de CPU |
+| **lxcfs** | outil qui remplace des fichiers de `/proc` par des versions qui reflètent les limites du cgroup |
+| **FUSE** | système de fichiers dont le contenu est fabriqué par un programme, et non par le noyau |
 
 ---
 
@@ -897,4 +1035,34 @@ qu'envoie l'OOM killer quand la limite mémoire est dépassée.
 Pas forcément. Le noyau lui accorde 50 ms de calcul toutes les 100 ms, sur
 n'importe quels cœurs. Au-delà, il est mis en pause jusqu'à la période
 suivante (throttling).
+</details>
+
+<details>
+<summary>20. Avec le namespace cgroup, que voit le conteneur dans /proc/self/cgroup, et pourquoi c'est mieux ?</summary>
+
+`0::/` : son cgroup lui apparaît comme la racine. Il ne découvre plus le
+chemin complet sur l'hôte (utilisateur, services…), et il peut lire ses
+limites dans `/sys/fs/cgroup`.
+</details>
+
+<details>
+<summary>21. Pourquoi os.totalmem() et process.constrainedMemory() de Node ne donnent-ils pas la même valeur ?</summary>
+
+`os.totalmem()` lit `/proc/meminfo` (la machine : 15 Go).
+`process.constrainedMemory()` lit le cgroup (la limite : 256 Mo).
+</details>
+
+<details>
+<summary>22. Comment sysinfo peut-il afficher 256 Mo sans modifier son code ?</summary>
+
+On monte un faux fichier par-dessus `/proc/meminfo` dans le namespace mount du
+conteneur. `sysinfo` lit ce fichier en croyant lire celui du noyau.
+</details>
+
+<details>
+<summary>23. Pourquoi notre faux meminfo devient-il faux au fil du temps, et comment lxcfs fait-il mieux ?</summary>
+
+C'est un fichier écrit une fois au démarrage, alors que le vrai est généré à
+chaque lecture. lxcfs utilise FUSE : un démon regénère le contenu à chaque
+lecture, à partir des valeurs actuelles du cgroup.
 </details>
