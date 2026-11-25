@@ -317,6 +317,10 @@ func child(cfg childConfig, args []string) {
 		if cfg.FakeMeminfo {
 			mountFakeMeminfo()
 		}
+		if cfg.Net == "pasta" {
+			// Comme Docker, on fournit le resolv.conf : l'image n'en a pas.
+			must("resolv.conf", writeFile("/etc/resolv.conf", "nameserver "+pastaDNS+"\n"))
+		}
 	} else {
 		// Sans rootfs, on garde les fichiers de l'hôte, avec un /proc neuf.
 		mountProc("/proc")
@@ -390,7 +394,9 @@ func loopbackUp() error {
 // de l'hôte. Il se met en arrière-plan une fois prêt, et s'arrête tout seul
 // quand le namespace disparaît.
 func startPasta(pid int, ports portList) error {
-	args := []string{"--config-net", "--quiet"}
+	// --dns-forward : les requêtes DNS envoyées à cette adresse, dans le
+	// conteneur, sont relayées au résolveur de l'hôte.
+	args := []string{"--config-net", "--quiet", "--dns-forward", pastaDNS}
 	for _, p := range ports {
 		args = append(args, "-t", p) // TCP : port de l'hôte → port du conteneur
 	}
@@ -405,6 +411,9 @@ func startPasta(pid int, ports portList) error {
 	}
 	return nil
 }
+
+// pastaDNS : l'adresse du DNS vue depuis le conteneur (la même que Podman).
+const pastaDNS = "169.254.1.1"
 
 // portList : les options -p, qui peuvent être répétées.
 type portList []string
