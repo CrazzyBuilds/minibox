@@ -37,7 +37,9 @@ func run(args []string) {
 
 	cmd.SysProcAttr = &syscall.SysProcAttr{
 		Cloneflags: syscall.CLONE_NEWUSER | // ses propres utilisateurs
-			syscall.CLONE_NEWUTS, // son propre hostname
+			syscall.CLONE_NEWUTS | // son propre hostname
+			syscall.CLONE_NEWPID | // sa propre numérotation des processus
+			syscall.CLONE_NEWNS, // ses propres points de montage
 
 		// User namespace : notre utilisateur (sur l'hôte) devient root (0)
 		// dans le conteneur. Root ici, simple utilisateur pour le noyau.
@@ -59,6 +61,16 @@ func run(args []string) {
 func child(args []string) {
 	if err := syscall.Sethostname([]byte("minibox")); err != nil {
 		fail("sethostname", err)
+	}
+
+	// Les montages faits ici ne doivent pas se propager à l'hôte.
+	if err := syscall.Mount("", "/", "", syscall.MS_REC|syscall.MS_PRIVATE, ""); err != nil {
+		fail("montages privés", err)
+	}
+	// ps lit /proc : on y monte un procfs neuf, qui ne montre que les
+	// processus de notre namespace PID. Celui de l'hôte n'est pas touché.
+	if err := syscall.Mount("proc", "/proc", "proc", 0, ""); err != nil {
+		fail("montage de /proc", err)
 	}
 
 	path, err := exec.LookPath(args[0])
