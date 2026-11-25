@@ -2,7 +2,7 @@
 //
 // Usage :
 //
-//	minibox run [-image DIR | -rootfs DIR] [-workdir DIR] [-memory 256M] [-cpus 0.5] [-pids 64] [-fake-meminfo] [commande [arguments...]]
+//	minibox run [-image DIR | -rootfs DIR] [-workdir DIR] [-memory 256M] [-cpus 0.5] [-pids 64] [-fake-meminfo] [-net none|host|pasta] [-p 8000:8000] [commande [arguments...]]
 package main
 
 import (
@@ -17,6 +17,7 @@ import (
 	"path/filepath"
 	"strings"
 	"syscall"
+	"unsafe"
 )
 
 // Environnement par défaut, quand on n'utilise pas d'image.
@@ -25,6 +26,15 @@ var defaultEnv = []string{"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bi
 // Périphériques indispensables, empruntés à l'hôte : sans être vraiment root,
 // on ne peut pas en créer (mknod), mais on peut monter ceux qui existent.
 var devices = []string{"null", "zero", "random", "urandom", "tty"}
+
+// childConfig : ce que run transmet à child pour préparer le conteneur.
+type childConfig struct {
+	Rootfs      string // racine du conteneur (vide : celle de l'hôte)
+	Workdir     string
+	Overlay     string // options de montage overlayfs (vide : pas d'overlay)
+	FakeMeminfo bool
+	Net         string // "none", "host" ou "pasta"
+}
 
 // imageConfig : la partie de config.json qui nous intéresse.
 type imageConfig struct {
@@ -51,11 +61,20 @@ func main() {
 		flags.StringVar(&lim.cpus, "cpus", "", "nombre de CPU utilisables (ex. 0.5)")
 		flags.StringVar(&lim.pids, "pids", "", "nombre maximal de processus")
 		fakeMeminfo := flags.Bool("fake-meminfo", false, "/proc/meminfo affiche la limite mémoire (comme lxcfs)")
+		netMode := flags.String("net", "none", "réseau : none (isolé), host (celui de l'hôte) ou pasta")
+		var ports portList
+		flags.Var(&ports, "p", "publie un port, ex. -p 8000:8000 (hôte:conteneur), implique -net pasta")
 		_ = flags.Parse(os.Args[2:])
-		run(*image, *rootfs, *workdir, lim, *fakeMeminfo, flags.Args())
+		if len(ports) > 0 {
+			*netMode = "pasta"
+		}
+		cfg := childConfig{Rootfs: *rootfs, Workdir: *workdir, FakeMeminfo: *fakeMeminfo, Net: *netMode}
+		run(*image, cfg, lim, ports, flags.Args())
 	case "child":
-		// Appelé uniquement par run : child <racine> <workdir> <overlay> <fake-meminfo> <commande...>
-		child(os.Args[2], os.Args[3], os.Args[4], os.Args[5] == "true", os.Args[6:])
+		// Appelé uniquement par run : child <configuration JSON> <commande...>
+		var cfg childConfig
+		must("configuration de l'enfant", json.Unmarshal([]byte(os.Args[2]), &cfg))
+		child(cfg, os.Args[3:])
 	default:
 		usage()
 	}
@@ -64,36 +83,38 @@ func main() {
 // run s'exécute sur l'hôte. Il prépare ce qui peut l'être de l'extérieur, puis
 // relance minibox lui-même (/proc/self/exe) en mode "child", dans de nouveaux
 // namespaces : c'est le noyau qui les crée, au moment du clone() de l'enfant.
-func run(image, rootfs, workdir string, lim limits, fakeMeminfo bool, args []string) {
+func run(image string, cfg childConfig, lim limits, ports portList, args []string) {
 	env := defaultEnv
-	overlay := "" // options de montage overlayfs, si on utilise une image
 	id := newID()
 
 	if image != "" {
-		cfg := loadConfig(image)
+		img := loadConfig(image)
 		// Comme docker run : sans commande, on lance le CMD de l'image.
 		if len(args) == 0 {
-			args = cfg.Config.Cmd
+			args = img.Config.Cmd
 		}
-		if workdir == "" {
-			workdir = cfg.Config.WorkingDir
+		if cfg.Workdir == "" {
+			cfg.Workdir = img.Config.WorkingDir
 		}
-		env = cfg.Config.Env
-		rootfs, overlay = prepareOverlay(image, id)
+		env = img.Config.Env
+		cfg.Rootfs, cfg.Overlay = prepareOverlay(image, id)
 	}
 
 	if len(args) == 0 {
 		usage()
 	}
-	if workdir == "" {
-		workdir = "/"
+	if cfg.Workdir == "" {
+		cfg.Workdir = "/"
 	}
-	if rootfs != "" {
-		rootfs = absolute(rootfs)
+	if cfg.Rootfs != "" {
+		cfg.Rootfs = absolute(cfg.Rootfs)
+	}
+	if cfg.Net != "none" && cfg.Net != "host" && cfg.Net != "pasta" {
+		fail("-net", fmt.Errorf("mode inconnu : %q", cfg.Net))
 	}
 
-	childArgs := append([]string{"child", rootfs, workdir, overlay, fmt.Sprint(fakeMeminfo)}, args...)
-	cmd := exec.Command("/proc/self/exe", childArgs...)
+	cfgJSON, _ := json.Marshal(cfg)
+	cmd := exec.Command("/proc/self/exe", append([]string{"child", string(cfgJSON)}, args...)...)
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
 	cmd.Env = append(env, "HOME=/root", "TERM=xterm")
 
@@ -116,7 +137,28 @@ func run(image, rootfs, workdir string, lim limits, fakeMeminfo bool, args []str
 	cmd.SysProcAttr.UseCgroupFD = true
 	cmd.SysProcAttr.CgroupFD = fd
 
-	err := cmd.Run()
+	// Réseau isolé, sauf -net host.
+	if cfg.Net != "host" {
+		cmd.SysProcAttr.Cloneflags |= syscall.CLONE_NEWNET
+	}
+
+	// Tube de synchronisation : l'enfant attend notre feu vert avant de
+	// lancer la commande, le temps qu'on branche son réseau de l'extérieur.
+	syncR, syncW, err := os.Pipe()
+	must("tube de synchronisation", err)
+	cmd.ExtraFiles = []*os.File{syncR} // devient le descripteur 3 de l'enfant
+
+	must("démarrage du conteneur", cmd.Start())
+	_ = syncR.Close()
+	if cfg.Net == "pasta" {
+		if err := startPasta(cmd.Process.Pid, ports); err != nil {
+			_ = cmd.Process.Kill()
+			fail("pasta", err)
+		}
+	}
+	_ = syncW.Close() // feu vert : l'enfant lit "fin de fichier" et continue
+
+	err = cmd.Wait()
 	_ = syscall.Close(fd)
 	if n := oomKills(cgroup); n > 0 {
 		fmt.Fprintf(os.Stderr, "minibox : le noyau a tué %d processus du conteneur : limite mémoire dépassée (OOM)\n", n)
@@ -246,21 +288,33 @@ func prepareOverlay(image, id string) (merged, options string) {
 
 // child s'exécute déjà dans les nouveaux namespaces. Il prépare
 // l'environnement du conteneur, puis se remplace par la commande demandée.
-func child(rootfs, workdir, overlay string, fakeMeminfo bool, args []string) {
+func child(cfg childConfig, args []string) {
+	rootfs, workdir := cfg.Rootfs, cfg.Workdir
+
+	// Attend le feu vert du parent (fermeture du tube, descripteur 3).
+	waitFile := os.NewFile(3, "sync")
+	_, _ = waitFile.Read(make([]byte, 1))
+	_ = waitFile.Close()
+
+	if cfg.Net != "host" {
+		// Un namespace réseau neuf ne contient que "lo", éteinte.
+		must("activation de lo", loopbackUp())
+	}
+
 	must("sethostname", syscall.Sethostname([]byte("minibox")))
 
 	// Les montages faits ici ne doivent pas se propager à l'hôte.
 	must("montages privés", syscall.Mount("", "/", "", syscall.MS_REC|syscall.MS_PRIVATE, ""))
 
-	if overlay != "" {
+	if cfg.Overlay != "" {
 		// Le montage overlay se fait ici, dans notre namespace mount : l'hôte
 		// ne le voit pas, et il disparaît avec le conteneur.
-		must("montage overlay", syscall.Mount("overlay", rootfs, "overlay", 0, overlay))
+		must("montage overlay", syscall.Mount("overlay", rootfs, "overlay", 0, cfg.Overlay))
 	}
 
 	if rootfs != "" {
 		changeRoot(rootfs)
-		if fakeMeminfo {
+		if cfg.FakeMeminfo {
 			mountFakeMeminfo()
 		}
 	} else {
@@ -306,6 +360,57 @@ func changeRoot(rootfs string) {
 	must("démontage de l'hôte", syscall.Unmount("/.oldroot", syscall.MNT_DETACH))
 	must("suppression de /.oldroot", os.Remove("/.oldroot"))
 }
+
+// loopbackUp allume l'interface "lo" du namespace réseau (l'équivalent de
+// "ip link set lo up"), avec un ioctl : on modifie les drapeaux de l'interface.
+func loopbackUp() error {
+	fd, err := syscall.Socket(syscall.AF_INET, syscall.SOCK_DGRAM, 0)
+	if err != nil {
+		return err
+	}
+	defer syscall.Close(fd)
+
+	var ifr struct { // struct ifreq du noyau
+		name  [syscall.IFNAMSIZ]byte
+		flags uint16
+		_     [22]byte
+	}
+	copy(ifr.name[:], "lo")
+	ifr.flags = syscall.IFF_UP | syscall.IFF_LOOPBACK | syscall.IFF_RUNNING
+	_, _, errno := syscall.Syscall(syscall.SYS_IOCTL, uintptr(fd), syscall.SIOCSIFFLAGS, uintptr(unsafe.Pointer(&ifr)))
+	if errno != 0 {
+		return errno
+	}
+	return nil
+}
+
+// startPasta branche le namespace réseau du conteneur à l'extérieur, sans
+// être root. pasta (projet passt, utilisé par Podman) rejoint le namespace,
+// y crée une interface, et relaie le trafic à travers des sockets ordinaires
+// de l'hôte. Il se met en arrière-plan une fois prêt, et s'arrête tout seul
+// quand le namespace disparaît.
+func startPasta(pid int, ports portList) error {
+	args := []string{"--config-net", "--quiet"}
+	for _, p := range ports {
+		args = append(args, "-t", p) // TCP : port de l'hôte → port du conteneur
+	}
+	if len(ports) == 0 {
+		args = append(args, "-t", "none")
+	}
+	args = append(args, "-u", "none", fmt.Sprint(pid))
+
+	out, err := exec.Command("pasta", args...).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("%v %s", err, out)
+	}
+	return nil
+}
+
+// portList : les options -p, qui peuvent être répétées.
+type portList []string
+
+func (p *portList) String() string     { return strings.Join(*p, ",") }
+func (p *portList) Set(v string) error { *p = append(*p, v); return nil }
 
 // mountCgroup monte le système de fichiers des cgroups. Grâce au namespace
 // cgroup, sa racine est le cgroup du conteneur : le programme y lit ses
@@ -400,6 +505,6 @@ func fail(step string, err error) {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage : minibox run [-image DIR | -rootfs DIR] [-workdir DIR] [-memory 256M] [-cpus 0.5] [-pids 64] [-fake-meminfo] [commande [arguments...]]")
+	fmt.Fprintln(os.Stderr, "usage : minibox run [-image DIR | -rootfs DIR] [-workdir DIR] [-memory 256M] [-cpus 0.5] [-pids 64] [-fake-meminfo] [-net none|host|pasta] [-p 8000:8000] [commande [arguments...]]")
 	os.Exit(2)
 }
