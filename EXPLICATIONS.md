@@ -554,14 +554,170 @@ Server listening on http://localhost:8000
 
 ---
 
+## 5. Étape 5 : cgroups, limiter ce que le conteneur consomme
+
+### Namespaces et cgroups : deux mécanismes différents
+
+```mermaid
+flowchart LR
+    P["processus du conteneur"]
+    P --> NS["namespaces<br/>👓 ce qu'il VOIT"]
+    P --> CG["cgroups<br/>⚖️ ce qu'il peut CONSOMMER"]
+    NS --> N1["hostname, processus,<br/>fichiers, réseau…"]
+    CG --> C1["mémoire, CPU,<br/>nombre de processus…"]
+```
+
+Jusqu'ici, le conteneur était **isolé** (il ne voit pas le reste) mais **pas
+limité** : il pouvait prendre toute la RAM et tout le CPU de la machine. Les
+**cgroups** (*control groups*) servent à ça : le noyau compte ce que consomme
+un groupe de processus, et l'empêche de dépasser des limites.
+
+### Un cgroup, c'est un dossier
+
+Comme `/proc`, les cgroups s'utilisent **avec des fichiers** : chaque cgroup
+est un dossier de `/sys/fs/cgroup`, chaque limite un fichier qu'on écrit.
+
+```
+/sys/fs/cgroup/                                    ← racine (root uniquement)
+└── user.slice/user-1000.slice/
+    └── user@1000.service/                         ← délégué par systemd : appartient à nathan
+        ├── app.slice/…                            ← tes applis (terminal, navigateur…)
+        └── minibox/                               ← créé par minibox
+            ├── cgroup.subtree_control  "+cpu +memory +pids"
+            └── 2e0a5f/                            ← un conteneur
+                ├── cgroup.procs        les PID qui en font partie
+                ├── memory.max          268435456       (256 Mo)
+                ├── memory.swap.max     0               (pas de swap)
+                ├── cpu.max             50000 100000    (0.5 CPU)
+                ├── pids.max            64
+                ├── memory.current      ← lu : consommation actuelle (12 Mo)
+                └── memory.events       ← lu : "oom_kill 1" si le noyau a tué
+```
+
+Tout le travail de `createCgroup` consiste à **créer un dossier et écrire
+dans des fichiers**. Pas besoin d'être root : systemd te délègue ta branche
+(`user@1000.service`), qui t'appartient.
+
+Le processus doit ensuite **entrer dans le cgroup**. minibox utilise
+`CLONE_INTO_CGROUP` : l'enfant **naît directement dedans**, il est donc limité
+dès sa première instruction.
+
+### Mémoire : le noyau tue au-delà de la limite
+
+```
+$ ./minibox run -image images/sysinfo -memory 256M /bin/sh -c '…node qui alloue 10 Mo en boucle…'
+MemTotal vu par le conteneur : MemTotal: 15693872 kB     ← il croit avoir 15 Go…
+alloué : 50 Mo
+alloué : 100 Mo
+alloué : 150 Mo
+alloué : 200 Mo
+minibox : le noyau a tué 1 processus du conteneur : limite mémoire dépassée (OOM)
+code de sortie : 137                                     ← 128 + 9 (SIGKILL)
+```
+
+```mermaid
+sequenceDiagram
+    participant N as node (conteneur)
+    participant K as noyau
+    N->>K: alloue 10 Mo
+    K->>K: memory.current + 10 Mo ≤ memory.max ?
+    K-->>N: oui, voilà
+    Note over N,K: … 25 fois …
+    N->>K: alloue 10 Mo
+    K->>K: 256 Mo dépassés, swap interdit
+    K-->>N: SIGKILL (OOM killer)
+    Note over K: memory.events : oom_kill 1
+```
+
+Le code **137** est celui que Docker affiche pour un conteneur `OOMKilled`.
+
+Sans `memory.swap.max = 0`, le conteneur n'aurait pas été tué : le noyau
+aurait envoyé l'excédent dans le swap (30 Go sur cette machine), et le
+programme serait devenu très lent au lieu de s'arrêter.
+
+### CPU : le noyau rationne le temps de calcul
+
+`cpu.max = "50000 100000"` : **50 ms de calcul autorisées toutes les 100 ms**.
+Au-delà, le processus est mis en pause jusqu'à la période suivante
+(*throttling*).
+
+```
+un calcul qui tourne pendant 3 s :
+sans limite      → CPU réellement obtenu : 2976 ms   (100 %)
+-cpus 0.5        → CPU réellement obtenu : 1498 ms   ( 50 %)
+-cpus 0.25       → CPU réellement obtenu :  750 ms   ( 25 %)
+```
+
+```
+-cpus 0.5, sur une période de 100 ms :
+|██████████░░░░░░░░░░|██████████░░░░░░░░░░|██████████░░░░░░░░░░|
+ 50 ms     50 ms      calcul    en pause
+ calcul    en pause
+```
+
+Le programme ne sait pas qu'il est limité : il est juste plus lent.
+
+### Nombre de processus : la protection contre les fork bombs
+
+```
+$ ./minibox run -image images/sysinfo -pids 10 /bin/sh -c '…lance 20 sleep…'
+/bin/sh: can't fork: Resource temporarily unavailable
+processus vivants dans le conteneur : 8 (limite : 10)
+```
+
+Sans cette limite, un programme qui se duplique à l'infini (*fork bomb*)
+pourrait saturer la table des processus de **toute la machine**.
+
+### La réponse à la question du TD2 Q4
+
+Ton API, limitée à 256 Mo et 0,5 CPU :
+
+| | Ce que dit `sysinfo` | La réalité (fichiers du cgroup, vus de l'hôte) |
+|---|---|---|
+| mémoire | `mem.total` : **15 Go** | `memory.max` : **256 Mo** |
+| CPU | `cpu.cores` : **8** | `cpu.max` : **0,5 CPU** |
+
+```mermaid
+flowchart TB
+    API["sysinfo-api"] -->|lit| PROC["/proc/meminfo, /proc/cpuinfo"]
+    PROC -->|généré pour| HOST["la machine entière<br/>15 Go, 8 threads"]
+    K["noyau"] -->|applique| CG["cgroup<br/>256 Mo, 0.5 CPU"]
+    CG -.->|limite réellement| API
+    PROC ~~~ CG
+```
+
+Les deux informations viennent du même noyau, mais **par deux chemins
+différents** :
+- `/proc/meminfo` décrit **la machine** (il n'existe pas de namespace
+  mémoire) ;
+- la limite vit dans **le cgroup**, que `sysinfo` ne lit pas.
+
+La limite est donc bien **réelle** (le noyau a tué le programme à 256 Mo),
+mais **invisible** pour un programme qui ne regarde que `/proc`. C'est un vrai
+problème en production : un programme qui dimensionne ses caches ou son nombre
+de threads d'après `/proc` croit avoir 15 Go et 8 cœurs, et se fait tuer.
+C'est pour ça que Node.js, Java ou Go lisent désormais **aussi** les fichiers
+de leur cgroup pour connaître leurs vraies limites.
+
+Sur Azure (TD4), le problème n'existait pas : la micro-VM avait **vraiment**
+1 vCPU et 1,5 Go, donc `/proc` disait vrai.
+
+> **À retenir** : namespaces = ce que le processus **voit**, cgroups = ce
+> qu'il peut **consommer**. Un cgroup est un dossier, une limite un fichier.
+> Les limites sont réelles mais **invisibles dans `/proc`**.
+
+---
+
 ## Récapitulatif
 
 ```
-  ./minibox run -image images/sysinfo
+  ./minibox run -image images/sysinfo -memory 256M -cpus 0.5
      │
      ├─ lit config.json (Cmd, WorkingDir, Env)                 (run)
      ├─ crée containers/<id>/{upper,work,merged}
+     ├─ crée le cgroup minibox/<id> et écrit ses limites
      ├─ clone() avec CLONE_NEWUSER, NEWUTS, NEWPID, NEWNS
+     │          et CLONE_INTO_CGROUP (né dans son cgroup)
      │
      └─ dans l'enfant :                                         (child)
           ├─ uid 1000 → uid 0               namespace user
@@ -589,6 +745,12 @@ Server listening on http://localhost:8000
 | **procfs** | le système de fichiers virtuel de `/proc`, généré par le noyau à chaque lecture |
 | **pivot_root** | échange la racine du namespace mount avec un autre point de montage |
 | **rootless** | conteneurs lancés sans être root, grâce au namespace user |
+| **overlayfs** | système de fichiers qui superpose des dossiers (couches) en une seule vue |
+| **copy-up** | copie d'un fichier dans `upper` au moment où le conteneur le modifie |
+| **whiteout** | marqueur qui signifie « ce fichier est supprimé » dans une couche |
+| **cgroup** | groupe de processus dont le noyau compte et limite la consommation |
+| **OOM killer** | le mécanisme du noyau qui tue un processus quand la mémoire manque |
+| **throttling** | mise en pause d'un processus qui a épuisé son quota de CPU |
 
 ---
 
@@ -697,4 +859,42 @@ créé, ou utiliser un build multi-stage.
 
 Rien n'est copié : on crée trois dossiers vides (`upper`, `work`, `merged`) et
 on monte un overlay par-dessus les couches existantes.
+</details>
+
+<details>
+<summary>15. Quelle est la différence entre un namespace et un cgroup ?</summary>
+
+Un namespace change ce que le processus **voit** (hostname, processus,
+fichiers…). Un cgroup limite ce qu'il peut **consommer** (mémoire, CPU,
+nombre de processus).
+</details>
+
+<details>
+<summary>16. Comment configure-t-on la limite mémoire d'un cgroup ?</summary>
+
+En écrivant dans un fichier : `memory.max` du dossier du cgroup, dans
+`/sys/fs/cgroup`. Un cgroup est un dossier, chaque limite un fichier.
+</details>
+
+<details>
+<summary>17. Un conteneur limité à 256 Mo affiche 15 Go dans /proc/meminfo. La limite est-elle fausse ?</summary>
+
+Non, elle est bien appliquée (le noyau tue le processus à 256 Mo). Mais
+`/proc/meminfo` décrit la machine entière : la limite est dans le cgroup, que
+le programme doit lire lui-même pour la connaître.
+</details>
+
+<details>
+<summary>18. Que signifie le code de sortie 137 ?</summary>
+
+128 + 9 : le processus a été tué par le signal 9 (`SIGKILL`). C'est ce
+qu'envoie l'OOM killer quand la limite mémoire est dépassée.
+</details>
+
+<details>
+<summary>19. Avec -cpus 0.5, le programme utilise-t-il un seul cœur à moitié ?</summary>
+
+Pas forcément. Le noyau lui accorde 50 ms de calcul toutes les 100 ms, sur
+n'importe quels cœurs. Au-delà, il est mis en pause jusqu'à la période
+suivante (throttling).
 </details>
