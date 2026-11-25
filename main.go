@@ -2,7 +2,7 @@
 //
 // Usage :
 //
-//	minibox run [-image DIR | -rootfs DIR] [-workdir DIR] [commande [arguments...]]
+//	minibox run [-image DIR | -rootfs DIR] [-workdir DIR] [-memory 256M] [-cpus 0.5] [-pids 64] [commande [arguments...]]
 package main
 
 import (
@@ -46,8 +46,12 @@ func main() {
 		image := flags.String("image", "", "image extraite par pull-image.sh (couches + config)")
 		rootfs := flags.String("rootfs", "", "dossier à utiliser tel quel comme racine")
 		workdir := flags.String("workdir", "", "dossier courant dans le conteneur")
+		var lim limits
+		flags.StringVar(&lim.memory, "memory", "", "mémoire maximale (ex. 256M, 1G)")
+		flags.StringVar(&lim.cpus, "cpus", "", "nombre de CPU utilisables (ex. 0.5)")
+		flags.StringVar(&lim.pids, "pids", "", "nombre maximal de processus")
 		_ = flags.Parse(os.Args[2:])
-		run(*image, *rootfs, *workdir, flags.Args())
+		run(*image, *rootfs, *workdir, lim, flags.Args())
 	case "child":
 		// Appelé uniquement par run : child <racine> <workdir> <overlay> <commande...>
 		child(os.Args[2], os.Args[3], os.Args[4], os.Args[5:])
@@ -59,9 +63,10 @@ func main() {
 // run s'exécute sur l'hôte. Il prépare ce qui peut l'être de l'extérieur, puis
 // relance minibox lui-même (/proc/self/exe) en mode "child", dans de nouveaux
 // namespaces : c'est le noyau qui les crée, au moment du clone() de l'enfant.
-func run(image, rootfs, workdir string, args []string) {
+func run(image, rootfs, workdir string, lim limits, args []string) {
 	env := defaultEnv
 	overlay := "" // options de montage overlayfs, si on utilise une image
+	id := newID()
 
 	if image != "" {
 		cfg := loadConfig(image)
@@ -73,7 +78,7 @@ func run(image, rootfs, workdir string, args []string) {
 			workdir = cfg.Config.WorkingDir
 		}
 		env = cfg.Config.Env
-		rootfs, overlay = prepareOverlay(image)
+		rootfs, overlay = prepareOverlay(image, id)
 	}
 
 	if len(args) == 0 {
@@ -103,13 +108,111 @@ func run(image, rootfs, workdir string, args []string) {
 		GidMappings: []syscall.SysProcIDMap{{ContainerID: 0, HostID: os.Getgid(), Size: 1}},
 	}
 
-	if err := cmd.Run(); err != nil {
+	// cgroup : l'enfant naît directement dans son cgroup (CLONE_INTO_CGROUP),
+	// il est donc limité dès sa première instruction.
+	cgroup, fd := createCgroup(id, lim)
+	cmd.SysProcAttr.UseCgroupFD = true
+	cmd.SysProcAttr.CgroupFD = fd
+
+	err := cmd.Run()
+	_ = syscall.Close(fd)
+	if n := oomKills(cgroup); n > 0 {
+		fmt.Fprintf(os.Stderr, "minibox : le noyau a tué %d processus du conteneur : limite mémoire dépassée (OOM)\n", n)
+	}
+	_ = os.Remove(cgroup) // un cgroup sans processus se supprime avec rmdir
+
+	if err != nil {
 		var exitErr *exec.ExitError
 		if errors.As(err, &exitErr) {
+			if ws, ok := exitErr.Sys().(syscall.WaitStatus); ok && ws.Signaled() {
+				os.Exit(128 + int(ws.Signal())) // convention des shells : 128 + signal
+			}
 			os.Exit(exitErr.ExitCode())
 		}
 		fail("lancement du conteneur", err)
 	}
+}
+
+// limits : les limites demandées sur la ligne de commande (vide = aucune).
+type limits struct {
+	memory, cpus, pids string
+}
+
+// cgroupParent : la branche de l'arbre des cgroups que systemd nous délègue.
+// Elle nous appartient : on peut y créer des sous-cgroups sans être root.
+func cgroupParent() string {
+	uid := os.Getuid()
+	return fmt.Sprintf("/sys/fs/cgroup/user.slice/user-%d.slice/user@%d.service/minibox", uid, uid)
+}
+
+// createCgroup crée le cgroup du conteneur et y écrit ses limites. Un cgroup
+// est un dossier, et chaque limite un fichier : on configure en écrivant.
+func createCgroup(id string, lim limits) (path string, fd int) {
+	parent := cgroupParent()
+	must("création du cgroup minibox", os.MkdirAll(parent, 0o755))
+	// Active les contrôleurs pour les cgroups enfants de "minibox".
+	must("activation des contrôleurs", writeFile(filepath.Join(parent, "cgroup.subtree_control"), "+cpu +memory +pids"))
+
+	path = filepath.Join(parent, id)
+	must("création du cgroup "+id, os.Mkdir(path, 0o755))
+
+	if lim.memory != "" {
+		must("memory.max", writeFile(filepath.Join(path, "memory.max"), parseSize(lim.memory)))
+		// Sans ça, le conteneur passerait en swap au lieu d'être limité.
+		must("memory.swap.max", writeFile(filepath.Join(path, "memory.swap.max"), "0"))
+	}
+	if lim.cpus != "" {
+		// cpu.max = "<quota> <période>" en microsecondes : 0.5 CPU =
+		// 50 ms de calcul autorisées toutes les 100 ms.
+		var cpus float64
+		if _, err := fmt.Sscanf(lim.cpus, "%g", &cpus); err != nil || cpus <= 0 {
+			fail("-cpus", fmt.Errorf("valeur invalide : %q", lim.cpus))
+		}
+		must("cpu.max", writeFile(filepath.Join(path, "cpu.max"), fmt.Sprintf("%d 100000", int(cpus*100000))))
+	}
+	if lim.pids != "" {
+		must("pids.max", writeFile(filepath.Join(path, "pids.max"), lim.pids))
+	}
+
+	fd, err := syscall.Open(path, syscall.O_RDONLY|syscall.O_DIRECTORY, 0)
+	if err != nil {
+		fail("ouverture du cgroup", err)
+	}
+	return path, fd
+}
+
+// oomKills lit dans memory.events combien de processus le noyau a tués
+// faute de mémoire.
+func oomKills(cgroup string) int {
+	data, err := os.ReadFile(filepath.Join(cgroup, "memory.events"))
+	if err != nil {
+		return 0
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		var n int
+		if _, err := fmt.Sscanf(line, "oom_kill %d", &n); err == nil {
+			return n
+		}
+	}
+	return 0
+}
+
+// parseSize convertit "256M" ou "1G" en octets ("268435456").
+func parseSize(s string) string {
+	units := map[byte]int64{'K': 1 << 10, 'M': 1 << 20, 'G': 1 << 30}
+	mult, n := int64(1), s
+	if u, ok := units[s[len(s)-1]]; ok {
+		mult, n = u, s[:len(s)-1]
+	}
+	var v int64
+	if _, err := fmt.Sscanf(n, "%d", &v); err != nil || v <= 0 {
+		fail("-memory", fmt.Errorf("valeur invalide : %q", s))
+	}
+	return fmt.Sprint(v * mult)
+}
+
+func writeFile(path, content string) error {
+	return os.WriteFile(path, []byte(content), 0o644)
 }
 
 // prepareOverlay crée les dossiers propres à ce conteneur et renvoie le
@@ -118,7 +221,7 @@ func run(image, rootfs, workdir string, args []string) {
 //	merged  ← ce que voit le conteneur : la superposition de tout le reste
 //	upper   ← les écritures de CE conteneur (lecture-écriture)
 //	layers/06 … layers/00  ← les couches de l'image (lecture seule, partagées)
-func prepareOverlay(image string) (merged, options string) {
+func prepareOverlay(image, id string) (merged, options string) {
 	layers, err := filepath.Glob(filepath.Join(absolute(image), "layers", "*"))
 	if err != nil || len(layers) == 0 {
 		fail("lecture des couches", fmt.Errorf("aucune couche dans %s/layers", image))
@@ -128,7 +231,6 @@ func prepareOverlay(image string) (merged, options string) {
 		layers[i], layers[j] = layers[j], layers[i]
 	}
 
-	id := newID()
 	dir := absolute(filepath.Join("containers", id))
 	for _, sub := range []string{"upper", "work", "merged"} {
 		must("création de "+sub, os.MkdirAll(filepath.Join(dir, sub), 0o755))
@@ -252,6 +354,6 @@ func fail(step string, err error) {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage : minibox run [-image DIR | -rootfs DIR] [-workdir DIR] [commande [arguments...]]")
+	fmt.Fprintln(os.Stderr, "usage : minibox run [-image DIR | -rootfs DIR] [-workdir DIR] [-memory 256M] [-cpus 0.5] [-pids 64] [commande [arguments...]]")
 	os.Exit(2)
 }
