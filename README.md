@@ -18,6 +18,7 @@ $ curl localhost:8123/api/v1/sysinfo     # depuis l'hôte
 
 Chaque étape correspond à un commit, et est expliquée (schémas, expériences,
 questions) dans [EXPLICATIONS.md](EXPLICATIONS.md).
+L'essentiel tient sur une page : [FICHE.md](FICHE.md).
 
 | Étape | Mécanisme |
 |---|---|
