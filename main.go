@@ -2,7 +2,7 @@
 //
 // Usage :
 //
-//	minibox run [-image DIR | -rootfs DIR] [-workdir DIR] [-memory 256M] [-cpus 0.5] [-pids 64] [commande [arguments...]]
+//	minibox run [-image DIR | -rootfs DIR] [-workdir DIR] [-memory 256M] [-cpus 0.5] [-pids 64] [-fake-meminfo] [commande [arguments...]]
 package main
 
 import (
@@ -50,11 +50,12 @@ func main() {
 		flags.StringVar(&lim.memory, "memory", "", "mémoire maximale (ex. 256M, 1G)")
 		flags.StringVar(&lim.cpus, "cpus", "", "nombre de CPU utilisables (ex. 0.5)")
 		flags.StringVar(&lim.pids, "pids", "", "nombre maximal de processus")
+		fakeMeminfo := flags.Bool("fake-meminfo", false, "/proc/meminfo affiche la limite mémoire (comme lxcfs)")
 		_ = flags.Parse(os.Args[2:])
-		run(*image, *rootfs, *workdir, lim, flags.Args())
+		run(*image, *rootfs, *workdir, lim, *fakeMeminfo, flags.Args())
 	case "child":
-		// Appelé uniquement par run : child <racine> <workdir> <overlay> <commande...>
-		child(os.Args[2], os.Args[3], os.Args[4], os.Args[5:])
+		// Appelé uniquement par run : child <racine> <workdir> <overlay> <fake-meminfo> <commande...>
+		child(os.Args[2], os.Args[3], os.Args[4], os.Args[5] == "true", os.Args[6:])
 	default:
 		usage()
 	}
@@ -63,7 +64,7 @@ func main() {
 // run s'exécute sur l'hôte. Il prépare ce qui peut l'être de l'extérieur, puis
 // relance minibox lui-même (/proc/self/exe) en mode "child", dans de nouveaux
 // namespaces : c'est le noyau qui les crée, au moment du clone() de l'enfant.
-func run(image, rootfs, workdir string, lim limits, args []string) {
+func run(image, rootfs, workdir string, lim limits, fakeMeminfo bool, args []string) {
 	env := defaultEnv
 	overlay := "" // options de montage overlayfs, si on utilise une image
 	id := newID()
@@ -91,7 +92,7 @@ func run(image, rootfs, workdir string, lim limits, args []string) {
 		rootfs = absolute(rootfs)
 	}
 
-	childArgs := append([]string{"child", rootfs, workdir, overlay}, args...)
+	childArgs := append([]string{"child", rootfs, workdir, overlay, fmt.Sprint(fakeMeminfo)}, args...)
 	cmd := exec.Command("/proc/self/exe", childArgs...)
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
 	cmd.Env = append(env, "HOME=/root", "TERM=xterm")
@@ -100,7 +101,8 @@ func run(image, rootfs, workdir string, lim limits, args []string) {
 		Cloneflags: syscall.CLONE_NEWUSER | // ses propres utilisateurs
 			syscall.CLONE_NEWUTS | // son propre hostname
 			syscall.CLONE_NEWPID | // sa propre numérotation des processus
-			syscall.CLONE_NEWNS, // ses propres points de montage
+			syscall.CLONE_NEWNS | // ses propres points de montage
+			syscall.CLONE_NEWCGROUP, // son cgroup lui apparaît comme la racine
 
 		// User namespace : notre utilisateur (sur l'hôte) devient root (0)
 		// dans le conteneur. Root ici, simple utilisateur pour le noyau.
@@ -244,7 +246,7 @@ func prepareOverlay(image, id string) (merged, options string) {
 
 // child s'exécute déjà dans les nouveaux namespaces. Il prépare
 // l'environnement du conteneur, puis se remplace par la commande demandée.
-func child(rootfs, workdir, overlay string, args []string) {
+func child(rootfs, workdir, overlay string, fakeMeminfo bool, args []string) {
 	must("sethostname", syscall.Sethostname([]byte("minibox")))
 
 	// Les montages faits ici ne doivent pas se propager à l'hôte.
@@ -258,6 +260,9 @@ func child(rootfs, workdir, overlay string, args []string) {
 
 	if rootfs != "" {
 		changeRoot(rootfs)
+		if fakeMeminfo {
+			mountFakeMeminfo()
+		}
 	} else {
 		// Sans rootfs, on garde les fichiers de l'hôte, avec un /proc neuf.
 		mountProc("/proc")
@@ -290,6 +295,7 @@ func changeRoot(rootfs string) {
 	// Tant que l'hôte est encore accessible dans /.oldroot, on lui emprunte
 	// ce dont on a besoin : /proc, puis quelques périphériques.
 	mountProc("/proc")
+	mountCgroup("/sys/fs/cgroup")
 	for _, dev := range devices {
 		target := "/dev/" + dev
 		must("création de "+target, touch(target))
@@ -299,6 +305,46 @@ func changeRoot(rootfs string) {
 	// On détache l'ancienne racine : plus aucun fichier de l'hôte n'est visible.
 	must("démontage de l'hôte", syscall.Unmount("/.oldroot", syscall.MNT_DETACH))
 	must("suppression de /.oldroot", os.Remove("/.oldroot"))
+}
+
+// mountCgroup monte le système de fichiers des cgroups. Grâce au namespace
+// cgroup, sa racine est le cgroup du conteneur : le programme y lit ses
+// propres limites (memory.max, cpu.max…), et rien de ce qui est au-dessus.
+func mountCgroup(target string) {
+	must("création de "+target, os.MkdirAll(target, 0o555))
+	must("montage de "+target, syscall.Mount("cgroup2", target, "cgroup2",
+		syscall.MS_NOSUID|syscall.MS_NODEV|syscall.MS_NOEXEC, ""))
+}
+
+// mountFakeMeminfo recouvre /proc/meminfo par un fichier qui annonce la
+// limite du cgroup au lieu de la RAM de la machine, comme le fait lxcfs.
+// Différence : lxcfs régénère le contenu à chaque lecture (avec FUSE), ici
+// c'est une photo prise au démarrage, qui ne bougera plus.
+func mountFakeMeminfo() {
+	max := readCgroupValue("/sys/fs/cgroup/memory.max")
+	if max <= 0 {
+		return // pas de limite mémoire : le vrai /proc/meminfo est juste
+	}
+	free := max - readCgroupValue("/sys/fs/cgroup/memory.current")
+	content := fmt.Sprintf("MemTotal: %d kB\nMemFree: %d kB\nMemAvailable: %d kB\n"+
+		"Buffers: 0 kB\nCached: 0 kB\nSwapTotal: 0 kB\nSwapFree: 0 kB\n", max/1024, free/1024, free/1024)
+
+	const fake = "/run/minibox-meminfo"
+	must("création de "+fake, writeFile(fake, content))
+	must("montage de /proc/meminfo", syscall.Mount(fake, "/proc/meminfo", "", syscall.MS_BIND, ""))
+}
+
+// readCgroupValue lit un nombre dans un fichier de cgroup ("max" = -1).
+func readCgroupValue(path string) int64 {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		fail("lecture de "+path, err)
+	}
+	var v int64
+	if _, err := fmt.Sscanf(string(data), "%d", &v); err != nil {
+		return -1
+	}
+	return v
 }
 
 // mountProc monte un procfs neuf : il ne montre que les processus de notre
@@ -354,6 +400,6 @@ func fail(step string, err error) {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage : minibox run [-image DIR | -rootfs DIR] [-workdir DIR] [-memory 256M] [-cpus 0.5] [-pids 64] [commande [arguments...]]")
+	fmt.Fprintln(os.Stderr, "usage : minibox run [-image DIR | -rootfs DIR] [-workdir DIR] [-memory 256M] [-cpus 0.5] [-pids 64] [-fake-meminfo] [commande [arguments...]]")
 	os.Exit(2)
 }
