@@ -317,8 +317,11 @@ func child(cfg childConfig, args []string) {
 		if cfg.FakeMeminfo {
 			mountFakeMeminfo()
 		}
+		// Comme Docker, on fournit /etc/hosts : sans lui, résoudre le nom
+		// "minibox" part en requête DNS, qui attend 5 s avant d'échouer.
+		must("/etc/hosts", writeFile("/etc/hosts", "127.0.0.1\tlocalhost minibox\n::1\tlocalhost minibox\n"))
 		if cfg.Net == "pasta" {
-			// Comme Docker, on fournit le resolv.conf : l'image n'en a pas.
+			// Idem pour le resolv.conf : l'image n'en a pas.
 			must("resolv.conf", writeFile("/etc/resolv.conf", "nameserver "+pastaDNS+"\n"))
 		}
 	} else {
