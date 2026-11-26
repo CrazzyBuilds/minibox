@@ -718,7 +718,7 @@ interfaces, ses adresses, sa table de routage, et **ses propres ports**.
 Au départ, elle est vide.
 
 ```
-=== hôte :       lo, enp2s0, wlo1 (10.17.213.206), br-… (le réseau de Docker)
+=== hôte :       lo, enp2s0, wlo1 (192.168.1.42), br-… (le réseau de Docker)
 === conteneur :  lo 127.0.0.1/8            ← et c'est tout
 ping 1.1.1.1 :   Network unreachable
 ```
@@ -778,7 +778,7 @@ ordinaire** qui :
 ```mermaid
 flowchart LR
     subgraph conteneur
-      N["node :8000"] --- T["interface tap<br/>10.17.213.206"]
+      N["node :8000"] --- T["interface tap<br/>192.168.1.42"]
     end
     T <--> P["pasta<br/>(processus de nathan)"]
     P <-->|"sockets ordinaires"| HS["pile réseau de l'hôte"]

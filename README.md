@@ -74,3 +74,7 @@ Projet pédagogique, pas un runtime de production :
 
 Le dossier `containers/` garde la couche inscriptible des conteneurs arrêtés,
 pour pouvoir l'inspecter.
+
+## Licence
+
+MIT, voir [LICENSE](LICENSE).
